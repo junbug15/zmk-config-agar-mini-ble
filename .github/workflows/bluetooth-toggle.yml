@@ -80,7 +80,7 @@ jobs:
           PY
       - name: Build Agar Mini firmware
         run: |
-          west build -s zmk/app -b klink -d build/bt-toggle -S studio-rpc-usb-uart -- -DZMK_CONFIG="${GITHUB_WORKSPACE}/config" -DZMK_EXTRA_MODULES="${GITHUB_WORKSPACE}" -DSHIELD=agar_mini_ble -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_SLEEP=n
+          west build -s zmk/app -b klink -d build/bt-toggle -S studio-rpc-usb-uart -- -DZMK_CONFIG="${GITHUB_WORKSPACE}/config" -DSHIELD=agar_mini_ble -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_SLEEP=n
       - name: Package test firmware
         shell: bash
         run: |
