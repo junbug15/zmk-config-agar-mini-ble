@@ -1,0 +1,105 @@
+name: Build Bluetooth toggle test firmware
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: zmkfirmware/zmk-build-arm:stable
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin inspected firmware dependencies
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import yaml
+          p = Path('config/west.yml')
+          d = yaml.safe_load(p.read_text())
+          pins = {'zmk': 'c526c062f974c87172782b8d964e2dd918e81923', 'zmk-keyboards-klink': 'e80a8335563aec32a8f2c47cba697077291bfb99'}
+          for project in d['manifest']['projects']:
+              project['revision'] = pins[project['name']]
+          p.write_text(yaml.safe_dump(d))
+          PY
+      - name: Fetch firmware build dependencies
+        run: |
+          west init -l config
+          west update --fetch-opt=--filter=blob:none
+          west zephyr-export
+      - name: Add Bluetooth pause and resume to KBD Lock
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+          p = Path('zmk/app/src/ble.c')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, repr(old)
+              s = s.replace(old, new, 1)
+          replace('#include <zmk/ble.h>', '#include <zmk/ble.h>\n#include <zmk/endpoints.h>\n#include <zephyr/sys/atomic.h>\nstatic atomic_t agar_bt_paused;\nK_MUTEX_DEFINE(agar_adv_lock);')
+          replace('int update_advertising(void) {', 'static int agar_update_advertising_locked(void) {')
+          replace('    LOG_DBG("advertising from %d to %d", advertising_status, desired_adv);', '    if (atomic_get(&agar_bt_paused)) { desired_adv = ZMK_ADV_NONE; }\n    LOG_DBG("advertising from %d to %d", advertising_status, desired_adv);')
+          replace('static void update_advertising_callback(struct k_work *work)', dedent('''
+          int update_advertising(void) {
+              k_mutex_lock(&agar_adv_lock, K_FOREVER);
+              int err = agar_update_advertising_locked();
+              k_mutex_unlock(&agar_adv_lock);
+              return err;
+          }
+          static void agar_disconnect(struct bt_conn *conn, void *unused) {
+              int err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+              if (err && err != -ENOTCONN) { LOG_WRN("Bluetooth disconnect: %d", err); }
+          }
+          static void agar_bt_toggle_work(struct k_work *work) {
+              zmk_endpoints_clear_current();
+              bool paused = !atomic_get(&agar_bt_paused);
+              atomic_set(&agar_bt_paused, paused);
+              int err = update_advertising();
+              if (err) { LOG_ERR("Bluetooth advertising update: %d", err); }
+              if (paused) { bt_conn_foreach(BT_CONN_TYPE_LE, agar_disconnect, NULL); }
+              LOG_INF("Agar Bluetooth %s", paused ? "paused" : "enabled");
+          }
+          K_WORK_DEFINE(agar_bt_toggle_job, agar_bt_toggle_work);
+          int agar_bt_toggle(void) {
+              return k_work_submit(&agar_bt_toggle_job);
+          }
+          ''') + '\nstatic void update_advertising_callback(struct k_work *work)')
+          replace('struct bt_conn *zmk_ble_active_profile_conn(void) {', 'struct bt_conn *zmk_ble_active_profile_conn(void) {\n    if (atomic_get(&agar_bt_paused)) { return NULL; }')
+          replace('    LOG_DBG("Connected %s", addr);', '    if (atomic_get(&agar_bt_paused)) {\n        bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);\n        return;\n    }\n    LOG_DBG("Connected %s", addr);')
+          p.write_text(s)
+          p = Path('zmk/app/src/behaviors/behavior_soft_off.c')
+          s = p.read_text()
+          assert s.count('zmk_pm_soft_off();') == 3
+          s = s.replace('#include <zmk/pm.h>', '#include <zmk/pm.h>\nextern int agar_bt_toggle(void);')
+          s = s.replace('zmk_pm_soft_off();', 'agar_bt_toggle();')
+          p.write_text(s)
+          print('Patched KBD Lock to pause/resume Bluetooth; keymap and pairing storage unchanged.')
+          PY
+      - name: Build Agar Mini firmware
+        run: |
+          west build -s zmk/app -b klink -d build/bt-toggle -S studio-rpc-usb-uart -- -DZMK_CONFIG="${GITHUB_WORKSPACE}/config" -DZMK_EXTRA_MODULES="${GITHUB_WORKSPACE}" -DSHIELD=agar_mini_ble -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_SLEEP=n
+      - name: Package test firmware
+        shell: bash
+        run: |
+          mkdir -p deliverable
+          cp build/bt-toggle/zephyr/zmk.uf2 deliverable/agar-mini-bluetooth-toggle-TEST.uf2
+          cat > deliverable/READ-ME-FIRST.txt <<'TXT'
+          EXPERIMENTAL Agar Mini Bluetooth toggle firmware.
+          KBD Lock is changed to Bluetooth pause/resume. Keep your Fn+Escape assignment.
+          Hold Fn+Escape for more than one second, then release Escape to toggle.
+          Off stops advertising and disconnects all Bluetooth peers. Keyboard scanning and USB remain active.
+          Other ordinary key presses do not restart advertising. Pairings are retained.
+          Deep sleep is disabled so the keyboard can keep detecting the shortcut.
+          A restart or loss of power enables Bluetooth again. This state is not persisted.
+          This build has not been verified on physical hardware. Back up your layout before flashing.
+          Test with the PC awake: pause, press other keys, then use Fn+Escape to reconnect.
+          The same key combination can still be accidentally pressed during transport.
+          TXT
+          sha256sum deliverable/*.uf2 > deliverable/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agar-mini-bluetooth-toggle-TEST
+          path: deliverable/
